@@ -15,13 +15,13 @@
       <div>
         <div class="eyebrow">EDGEONE MAKERS · WEBDAV · CDN RANGE CACHE</div>
         <h1>WebDAV Gateway</h1>
-        <p>固定 WebDAV 后端由 Makers 环境变量提供。Cloud Function 负责管理与分片上传，Edge Function 负责目录缓存与 CDN 回源网关，EdgeOne 原生 CDN 缓存大文件 Range。</p>
+        <p>固定 WebDAV 后端由 Makers 环境变量提供。Cloud Function 统一负责 WebDAV 管理、上传和下载 Range 回源，Edge Function 仅负责目录 KV 缓存，EdgeOne CDN 缓存大文件。</p>
       </div>
       <div id="connectionBadge" class="status-badge offline"><span class="status-dot"></span><span>未连接</span></div>
     </header>
 
     <section class="notice">
-      <strong>安全模型：</strong>WebDAV 地址、账号、密码仅存在于服务端环境变量；浏览器不接收密码，也不会把凭据写入 session token、下载 ticket、KV 或 Blob。文件永久只存 WebDAV。
+      <strong>安全模型：</strong>WebDAV 地址、账号、密码仅存在于 Makers 环境变量；浏览器不接收密码。CDN HIT 直接返回；CDN MISS 通过受 X-CDN-Origin-Key 保护的 Makers Cloud Function 按 Range 读取 WebDAV。文件永久只存 WebDAV。
     </section>
 
     <section class="panel connection-panel">

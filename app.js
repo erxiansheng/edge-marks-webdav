@@ -56,7 +56,7 @@ async function connect() {
     state.session=payload.session; state.connected=true;
     setStatus('online','已连接');
     el.summary.classList.remove('empty');
-    el.summary.innerHTML=`<strong>${escapeHtml(payload.connection.baseUrl)}</strong><br>账号：${escapeHtml(payload.connection.username)} · 配置来源：环境变量 · WebDAV 探测：HTTP ${payload.connection.probe.status} · ${payload.connection.probe.latencyMs} ms<br><span class="ok">浏览器未接收 WebDAV 密码；session token 与下载 ticket 均不包含 WebDAV 凭据。</span>`;
+    el.summary.innerHTML=`<strong>${escapeHtml(payload.connection.baseUrl)}</strong><br>账号：${escapeHtml(payload.connection.username)} · 配置来源：环境变量 · WebDAV 探测：HTTP ${payload.connection.probe.status} · ${payload.connection.probe.latencyMs} ms<br><span class="ok">浏览器未接收 WebDAV 密码；下载使用 EdgeOne CDN 原生直链；CDN MISS 时由分片回源访问 Makers Cloud Function → WebDAV Range。</span>`;
     log(`连接成功，延迟 ${payload.connection.probe.latencyMs} ms`,'success');
     await loadDirectory('/');
   } catch(error){ state.connected=false; setStatus('offline','连接失败'); log(error.message,'error'); toast(error.message,true); }
@@ -129,12 +129,40 @@ async function uploadSelected(file){
   finally{ state.busy=false; el.fileInput.value=''; hideProgress(); updateControls(); }
 }
 
+function nativeDownload(url,name){
+  const a=document.createElement('a'); a.href=url; a.download=name; a.rel='noreferrer'; document.body.append(a); a.click(); a.remove();
+}
+
+async function primeCdnRangeMetadata(url){
+  // EdgeOne 冷缓存首次完整 GET 需要先知道源站是否支持 Range 以及文件总大小。
+  // 先发一个不可见的 1-byte Range 探测，让 CDN 获得 Content-Range/总大小。
+  // 这里只读取 1 byte，不做文件分片下载，也不在前端拼接文件。
+  const response=await fetch(url,{
+    method:'GET',
+    headers:{Range:'bytes=0-0'},
+    credentials:'omit'
+  });
+  if(response.status!==206){
+    throw new Error(`CDN Range 探测失败：HTTP ${response.status}，请检查分片回源和 /download/* 回源规则`);
+  }
+  const contentRange=response.headers.get('content-range')||'';
+  if(!/^bytes\s+0-0\/\d+$/i.test(contentRange)){
+    throw new Error(`CDN Range 探测缺少有效 Content-Range：${contentRange||'empty'}`);
+  }
+  await response.arrayBuffer(); // 实际只消费 1 byte，确保探测请求完整结束。
+  return contentRange;
+}
+
 async function downloadItem(item){
-  setBusy(true,'生成下载链接'); log(`生成 CDN 下载链接：${item.path}`);
+  setBusy(true,'生成下载直链'); log(`生成 CDN 原生下载直链：${item.path}`);
   try{
-    const response=await postJson('/api/webdav/download-url',{session:state.session,path:item.path}); const payload=await response.json();
-    log(payload.mode==='edgeone-native-cdn'?`EdgeOne CDN 链接已生成：${payload.cdn.host} / ${payload.file.fileId.slice(0,12)}…`:'未配置 CDN，使用当前站点 Edge Function 流式下载','success');
-    const a=document.createElement('a'); a.href=payload.url; a.download=item.name; a.rel='noreferrer'; document.body.append(a); a.click(); a.remove();
+    const response=await postJson('/api/webdav/download-url',{session:state.session,path:item.path});
+    const payload=await response.json();
+    log(`CDN Range 元数据探测：${payload.cdn.host} / bytes=0-0`);
+    const contentRange=await primeCdnRangeMetadata(payload.url);
+    log(`Range 探测成功：${contentRange}；开始浏览器原生直链下载`,'success');
+    nativeDownload(payload.url,item.name);
+    toast('已交给浏览器原生下载');
   }catch(error){ log(error.message,'error'); toast(error.message,true); }
   finally{ state.busy=false; setStatus('online','已连接'); updateControls(); }
 }

@@ -1,110 +1,117 @@
-# EdgeOne Makers WebDAV Gateway v2.2
+# EdgeOne Makers WebDAV Gateway v2.8
 
-一个适合部署在腾讯云 EdgeOne Makers 的固定后端 WebDAV 网关。WebDAV 地址、账号和密码全部由 Makers **环境变量**提供，前端不再输入或保存 WebDAV 凭据。
+固定 WebDAV 后端 + EdgeOne CDN 大文件缓存 Demo。
 
-项目目标：
+v2.8 的核心原则是：**任何真正访问 WebDAV 的 HTTP 请求都只能由 Makers Cloud Function 发出。** Edge Function 不再直接连接 WebDAV，只负责 session 校验、KV 目录缓存和调用项目内部 Cloud Function。
 
-- 文件最终只保存在 WebDAV。
-- 不使用 Blob 保存文件。
-- Cloud Function 负责 WebDAV 管理、普通上传和大文件分片上传。上传实体统一使用 JSON + Base64 传输，规避 Makers Node.js 运行时对原始二进制 Request body 的重复消费问题。
-- Edge Function 负责目录读取 / KV 元数据缓存，以及 CDN MISS 时的大文件 Range 回源。
-- 独立 EdgeOne 站点加速域名负责大文件 CDN / Range 缓存。
-- WebDAV 密码不进入前端、不进入 KV，也不封装进浏览器 session token 或下载 ticket。
+```text
+上传 / 管理：
+浏览器 -> Makers Cloud Function -> WebDAV
+
+目录读取：
+浏览器 -> Makers Edge Function -> KV
+                         |-- HIT -> 直接返回
+                         `-- MISS -> Makers Cloud Function -> WebDAV PROPFIND
+
+下载：
+浏览器 -> EdgeOne CDN
+              |-- HIT -> 直接返回
+              `-- MISS -> Makers Cloud Function -> WebDAV Range
+```
+
+因此 WebDAV 侧看到的请求来源统一为 Cloud Function：
+
+```text
+PROPFIND / HEAD / GET / Range / PUT / MKCOL / DELETE
+                         ↓
+                 Makers Cloud Function
+                         ↓
+                      WebDAV
+```
+
+最终文件只保存在 WebDAV。Blob 不参与文件存储。KV 只保存短期目录元数据。
+
+## 为什么所有 WebDAV 请求都统一经过 Cloud Function
+
+目的是避免 CDN 节点或全球 Edge Function 直接访问 WebDAV。目录 KV MISS 的 `PROPFIND`、文件 `GET/Range`、上传 `PUT`、建目录 `MKCOL`、删除 `DELETE`、连接探测和文件属性读取现在全部由 Makers Cloud Function 发起。Edge Function 只操作 KV，不携带 WebDAV 密码发起上游请求。
+
+注意：**固定 Cloud Function 地域不等于固定公网出口 IP**。Makers Cloud Function 仍是 Serverless。当前 `edgeone.json` 固定中国大陆 Cloud Function 到广州，只能让来源区域更加集中；如果必须让 WebDAV 永远只看到一个公网 IP，仍需要固定 EIP / 固定出口代理。
+
+## 原生直链下载与 Range 说明
+
+v2.8 不再让前端把大文件拆成 Range 后自行拼接。点击“下载”后，Cloud Function 只负责生成一个带 Token D 的 CDN 直链，然后直接交给浏览器/系统下载器：
+
+```text
+点击下载
+  ↓
+POST /api/webdav/download-url
+  ↓
+返回 https://123cdn.example.com/download/<version>/<path>?token=...&t=...
+  ↓
+浏览器原生下载
+  ↓
+EdgeOne CDN
+  |-- HIT -> 直接返回
+  `-- MISS -> 分片回源 -> Makers Cloud Function -> WebDAV Range
+```
+
+这样可以使用浏览器原生下载管理、暂停/续传（取决于浏览器/CDN/源站 Range 支持），也不需要前端把整个文件放进内存或自行写磁盘。
+
+### 为什么仍保留 `CDN_RANGE_BYTES=4194304`
+
+Cloud Function 请求/响应 Body 上限为 6 MB，因此下载源站路由仍将**单次回源 Range 的安全上限**限制为 4 MiB：
+
+```env
+CDN_RANGE_BYTES=4194304
+```
+
+这个值现在是 Cloud Function 的安全上限，不再代表浏览器主动分片大小。
+
+重要：EdgeOne 当前公开的“分片回源”配置主要提供开关，平台实际向源站请求的分片大小由 EdgeOne 控制。应用代码无法在保持单一原生直链的同时强制 CDN 一定按 4 MiB 回源。只要 EdgeOne 每次回源 Range 不超过 4 MiB，本项目即可正常代理；平台默认较小分片同样可以工作。
 
 ---
 
-## 1. 架构
-<img width="1672" height="941" alt="ChatGPT Image 2026年8月27日 13_30_22" src="https://github.com/user-attachments/assets/9a6fa3f8-1a7e-4a3e-9cfa-ba16bdae8356" />
+# 1. 环境变量
 
-```text
-                           EdgeOne Makers
-                                │
-           ┌────────────────────┼────────────────────┐
-           │                    │                    │
-      静态前端              Cloud Function       Edge Function
-           │                    │                    │
-           │                    ├─ 创建目录          ├─ 目录读取
-           │                    ├─ 删除              ├─ KV 目录缓存
-           │                    ├─ ≤4 MiB 上传       └─ CDN MISS 下载网关
-           │                    └─ >4 MiB 分片上传          │
-           │                            │                    │ Range
-           └────────────────────────────┴──────────────→ WebDAV
-                                                        │
-                                                        │ 文件本体
-                                                        ▼
-                                             EdgeOne 原生 CDN
-                                                        │
-                                                   CDN HIT
-                                                        │
-                                                        ▼
-                                                       用户
-```
-
-### 数据保存位置
-
-| 数据 | 保存位置 |
-| --- | --- |
-| 最终文件 | WebDAV |
-| 大文件上传临时分片 | WebDAV `/.edgeone-upload/...`，合并成功后删除 |
-| WebDAV 地址 | Makers 环境变量 |
-| WebDAV 账号 | Makers 环境变量 |
-| WebDAV 密码 | Makers 环境变量 |
-| 浏览器 session | 短期加密 token，不包含 WebDAV 地址/账号/密码 |
-| 下载 ticket | 短期加密 token，只包含文件 path / fileId / filename，不包含 WebDAV 凭据 |
-| 目录列表元数据 | KV，可选 |
-| 下载文件内容 | EdgeOne CDN 节点缓存 |
-| Blob | 不使用 |
-
----
-
-## 2. 必须配置的环境变量
-
-进入：
-
-```text
-EdgeOne Makers
-→ 你的项目
-→ 设置
-→ 环境变量
-→ Production / 生产环境
-```
-
-至少配置下面 4 个变量：
-
-| 环境变量 | 是否必填 | 示例 | 说明 |
-| --- | --- | --- | --- |
-| `WEBDAV_BASE_URL` | 是 | `https://webdav.example.com/webdav` | WebDAV 根地址，必须为 HTTPS |
-| `WEBDAV_USERNAME` | 是 | `your_username` | WebDAV 账号 |
-| `WEBDAV_PASSWORD` | 是 | `your_password` | WebDAV 密码，仅服务端读取 |
-| `WEBDAV_SESSION_SECRET` | 是 | 长随机字符串 | 用于签发 session / download ticket，至少 24 字符 |
-
-推荐生成一个长度至少 32～64 字符的随机 `WEBDAV_SESSION_SECRET`。
-
-完整最小配置：
+## 必填：WebDAV
 
 ```env
 WEBDAV_BASE_URL=https://webdav.example.com/webdav
 WEBDAV_USERNAME=your_username
 WEBDAV_PASSWORD=your_password
 WEBDAV_SESSION_SECRET=replace_with_a_long_random_secret_at_least_24_chars
+WEBDAV_INTERNAL_KEY=replace_with_a_separate_internal_secret_at_least_24_chars
 ```
 
-> 不要把真实账号、密码或 `WEBDAV_SESSION_SECRET` 写进 GitHub、`.env.example`、前端 JavaScript 或 README。
+说明：
 
----
+- `WEBDAV_BASE_URL`：WebDAV 根地址，必须 HTTPS。
+- `WEBDAV_USERNAME`：WebDAV 用户名。
+- `WEBDAV_PASSWORD`：WebDAV 密码。
+- `WEBDAV_SESSION_SECRET`：浏览器无凭据 session 的加密密钥，至少 24 字符，建议 32~64 位随机值。
+- `WEBDAV_INTERNAL_KEY`：Edge Function 在 KV MISS 时调用内部目录 Cloud Function 的独立密钥，至少 24 字符，建议 32~64 位随机值。不要与 `WEBDAV_SESSION_SECRET`、`CDN_AUTH_KEY` 或 `CDN_ORIGIN_KEY` 共用。
 
-## 3. WebDAV 可选环境变量
+浏览器不会收到 `WEBDAV_PASSWORD` 或 `WEBDAV_INTERNAL_KEY`。
 
-| 环境变量 | 默认值 | 说明 |
-| --- | ---: | --- |
-| `WEBDAV_ALLOWED_HOSTS` | 自动取 `WEBDAV_BASE_URL` 的 hostname | WebDAV 主机白名单；支持逗号分隔和 `*.example.com` |
-| `WEBDAV_CHUNK_BYTES` | `4194304` | 大文件浏览器分片大小，默认且最大 4 MiB；Base64 后约 5.34 MiB，留在 Cloud Function 6 MB Body 限制内 |
-| `WEBDAV_MAX_UPLOAD_BYTES` | `8589934592` | 单文件最大上传大小，默认 8 GiB |
-| `WEBDAV_TEMP_DIR` | `/.edgeone-upload` | WebDAV 临时上传分片目录 |
-| `WEBDAV_SESSION_TTL_SECONDS` | `43200` | 浏览器 session 有效期，默认 12 小时 |
-| `DIRECTORY_CACHE_TTL_MS` | `15000` | KV 目录缓存逻辑 TTL，默认 15 秒 |
+## 必填：CDN
 
-推荐配置：
+```env
+CDN_DOWNLOAD_HOST=123cdn.example.com
+CDN_AUTH_KEY=replace_with_edgeone_token_auth_method_d_key
+CDN_TOKEN_VALID_SECONDS=3600
+CDN_ORIGIN_KEY=replace_with_a_separate_random_origin_secret
+CDN_RANGE_BYTES=4194304
+```
+
+说明：
+
+- `CDN_DOWNLOAD_HOST`：独立 EdgeOne CDN 下载域名，不带 `https://`。
+- `CDN_AUTH_KEY`：必须与 EdgeOne Token 鉴权“方式 D”的主密钥完全一致。
+- `CDN_TOKEN_VALID_SECONDS`：下载 URL 有效时间，建议 3600 秒。
+- `CDN_ORIGIN_KEY`：CDN 回源到 Makers 时注入的独立密钥，至少 24 字符；**不要和 CDN_AUTH_KEY 使用同一个值**。
+- `CDN_RANGE_BYTES`：Cloud Function 可接受的单次 CDN 回源 Range 上限；默认/最大 4 MiB。它不强制 EdgeOne 实际使用 4 MiB 分片。
+
+## 可选
 
 ```env
 WEBDAV_ALLOWED_HOSTS=webdav.example.com
@@ -115,548 +122,547 @@ WEBDAV_SESSION_TTL_SECONDS=43200
 DIRECTORY_CACHE_TTL_MS=15000
 ```
 
-### `WEBDAV_ALLOWED_HOSTS`
-
-固定 WebDAV 模式下，如果不填写这个变量，程序会自动只允许 `WEBDAV_BASE_URL` 自身 hostname。
-
-例如：
+### 完整示例
 
 ```env
 WEBDAV_BASE_URL=https://webdav.example.com/webdav
-```
-
-则默认只允许：
-
-```text
-webdav.example.com
-```
-
-如果你的 WebDAV 会跳转到其他同域子站，可以显式配置：
-
-```env
-WEBDAV_ALLOWED_HOSTS=webdav.example.com,*.example.com
-```
-
----
-
-## 4. CDN 下载环境变量
-
-如果只想使用 Makers 自身流式下载，可以不配置 CDN。
-
-如果要启用独立 EdgeOne CDN 下载域名，则还必须配置：
-
-| 环境变量 | 是否必填 | 示例 | 说明 |
-| --- | --- | --- | --- |
-| `CDN_DOWNLOAD_HOST` | CDN 模式必填 | `123cdn.dasb.cn` | 独立 EdgeOne 加速域名，只填 hostname，不带 `https://` |
-| `CDN_AUTH_KEY` | CDN 模式必填 | 随机密钥 | 必须和 EdgeOne Token 鉴权「方式 D」主密钥一致 |
-| `CDN_TOKEN_VALID_SECONDS` | 否 | `3600` | 下载签名有效期，默认 1 小时 |
-
-例如你当前的 CDN 域名是：
-
-```env
-CDN_DOWNLOAD_HOST=123cdn.dasb.cn
-CDN_AUTH_KEY=replace_with_the_same_key_configured_in_edgeone
-CDN_TOKEN_VALID_SECONDS=3600
-```
-
-**注意：`CDN_DOWNLOAD_HOST` 和 `CDN_AUTH_KEY` 必须同时存在。** v2.3 起如果只配置域名、不配置密钥，接口会直接返回 `CDN_AUTH_KEY_MISSING`，不会再静默生成 Makers 内部 `pages-scf-*.qcloudteo.com` 地址。
-
-`CDN_AUTH_KEY` 必须同时配置在：
-
-```text
-EdgeOne 站点加速
-→ 123cdn.dasb.cn
-→ Token 鉴权
-→ 方式 D
-```
-
-并与 Makers 环境变量里的值完全相同。
-
-### CDN 下载 URL
-
-项目会自动生成类似：
-
-```text
-https://123cdn.dasb.cn/download/<fileId>?ticket=...&token=...&t=...
-```
-
-其中：
-
-- `/download/<fileId>` 是稳定、版本化的 CDN Cache Key。
-- `ticket` 只保存文件 path / fileId / filename，不保存 WebDAV 凭据。
-- `token` + `t` 用于 EdgeOne Token 鉴权方式 D。
-- CDN MISS 时 Edge Function 才从环境变量读取 WebDAV 账号密码并回源。
-
----
-
-## 5. 一份完整的环境变量示例
-
-```env
-# ===== WebDAV：必填 =====
-WEBDAV_BASE_URL=https://webdav.example.com/webdav
-WEBDAV_USERNAME=your_webdav_username
-WEBDAV_PASSWORD=your_webdav_password
-WEBDAV_SESSION_SECRET=replace_with_a_long_random_secret_at_least_24_chars
-
-# ===== WebDAV：可选 =====
+WEBDAV_USERNAME=your_username
+WEBDAV_PASSWORD=your_password
+WEBDAV_SESSION_SECRET=replace_with_random_32_to_64_chars
+WEBDAV_INTERNAL_KEY=replace_with_another_random_32_to_64_chars
 WEBDAV_ALLOWED_HOSTS=webdav.example.com
+
 WEBDAV_CHUNK_BYTES=4194304
 WEBDAV_MAX_UPLOAD_BYTES=8589934592
 WEBDAV_TEMP_DIR=/.edgeone-upload
 WEBDAV_SESSION_TTL_SECONDS=43200
 DIRECTORY_CACHE_TTL_MS=15000
 
-# ===== EdgeOne CDN：启用 CDN 时配置 =====
-CDN_DOWNLOAD_HOST=123cdn.dasb.cn
-CDN_AUTH_KEY=replace_with_edgeone_type_d_auth_key
+CDN_DOWNLOAD_HOST=123cdn.example.com
+CDN_AUTH_KEY=replace_with_token_d_secret
 CDN_TOKEN_VALID_SECONDS=3600
+CDN_ORIGIN_KEY=replace_with_another_random_32_to_64_chars
+CDN_RANGE_BYTES=4194304
 ```
-
-### 环境变量清单汇总
-
-```text
-WEBDAV_BASE_URL
-WEBDAV_USERNAME
-WEBDAV_PASSWORD
-WEBDAV_SESSION_SECRET
-WEBDAV_ALLOWED_HOSTS
-WEBDAV_CHUNK_BYTES
-WEBDAV_MAX_UPLOAD_BYTES
-WEBDAV_TEMP_DIR
-WEBDAV_SESSION_TTL_SECONDS
-DIRECTORY_CACHE_TTL_MS
-CDN_DOWNLOAD_HOST
-CDN_AUTH_KEY
-CDN_TOKEN_VALID_SECONDS
-```
-
-另外还有一个 **KV Binding**：
-
-```text
-WEBDAV_KV
-```
-
-它不是普通字符串环境变量，需要在 Makers 控制台绑定 KV Namespace。
 
 ---
 
-## 6. KV 目录缓存
+# 2. KV 绑定
 
-KV 是可选功能。不绑定 KV 也能正常浏览、上传和下载。
+KV 只缓存目录列表 JSON，不缓存文件内容，不保存 WebDAV 密码。
 
-如果需要目录缓存：
-
-1. 在 EdgeOne Makers 创建 KV Namespace。
-2. 绑定到当前项目。
-3. Binding / 变量名固定填写：
+在 Makers 项目绑定一个 KV Namespace，变量名固定：
 
 ```text
 WEBDAV_KV
 ```
 
-目录读取流程：
+未绑定也能运行，目录接口会显示：
 
 ```text
-浏览器
-  ↓
-Edge Function
-  ↓
-WEBDAV_KV
-  ├─ HIT  → 直接返回目录 JSON
-  └─ MISS → WebDAV PROPFIND → 写入 KV → 返回
+KV BYPASS
 ```
 
-上传、删除或新建目录后，前端会主动调用缓存失效接口。
+## 目录读取的内部调用链
 
-KV 只保存目录列表 JSON，不保存：
+v2.8 中 Edge Function **绝不直接 `PROPFIND` WebDAV**。KV MISS 时只调用同项目的内部 Cloud Function：
 
-- WebDAV 密码
-- WebDAV 文件内容
-- 上传分片
-- CDN 文件缓存
+```text
+POST /api/webdav/list
+        ↓
+Makers Edge Function
+        ↓
+读取 WEBDAV_KV
+  |-- HIT -> 返回
+  `-- MISS
+        ↓
+POST /api/internal/webdav/list
+X-WebDAV-Internal-Key: <WEBDAV_INTERNAL_KEY>
+        ↓
+Makers Cloud Function
+        ↓ PROPFIND
+WebDAV
+        ↓
+Cloud Function -> Edge Function -> 写入 KV -> 浏览器
+```
+
+`/api/internal/webdav/list` 会同时校验：
+
+- `X-WebDAV-Internal-Key` 必须与 Makers 的 `WEBDAV_INTERNAL_KEY` 完全一致；
+- 浏览器 session 仍必须有效；
+- WebDAV 用户名和密码只由 Cloud Function 从 Makers 环境变量读取。
+
+直接从浏览器调用内部目录接口且没有正确 Internal Key 会返回 `403 INTERNAL_ORIGIN_FORBIDDEN`。
 
 ---
 
-## 7. EdgeOne CDN 域名配置
+# 3. Makers Cloud Function 地域
 
-推荐使用两个**自定义域名**：
+`edgeone.json` 当前固定中国大陆 Cloud Function 地域为广州：
 
-```text
-test6.dasb.cn      → EdgeOne Makers 项目自定义域名
-123cdn.dasb.cn     → EdgeOne 站点加速
-                       ↓
-                  源站：https://test6.dasb.cn
-                  回源 HOST：test6.dasb.cn
+```json
+{
+  "cloudFunctions": {
+    "mainlandRegions": ["ap-guangzhou"],
+    "nodejs": {
+      "maxDuration": 120
+    }
+  }
+}
 ```
 
-> **不要把 `*.edgeone.cool` 项目域名或 Deployment/Preview 域名直接作为 CDN 源站。** 在部分加速区域下，Makers 项目域名需要带 3 小时有效的 Preview 鉴权信息；CDN 回源不会携带这个 Preview 凭据，会得到 `401 UNAUTHORIZED / Authentication Expired`。稳定回源应绑定并使用 Makers 自定义域名，例如当前部署的 `test6.dasb.cn`。
+这样可以避免中国大陆请求在多个 Cloud Function 地域之间随机部署。
 
-你的 CDN 域名规则建议只匹配：
+如果项目加速区域包含中国大陆以外，EdgeOne 还会涉及海外 Cloud Function 地域。可以在控制台或 `edgeone.json` 中额外固定一个 `overseasRegions` 地域。
+
+---
+
+# 4. EdgeOne CDN 域名配置
+
+以下示例假设：
 
 ```text
-/download/*
+Makers 自定义域名：test6.example.com
+CDN 下载域名：     123cdn.example.com
 ```
 
-建议配置：
+## CDN 源站
+
+`123cdn.example.com` 的源站配置：
+
+```text
+源站类型：域名
+源站：test6.example.com
+回源协议：HTTPS
+HTTPS 端口：443
+回源 HOST：test6.example.com
+```
+
+**不要再把 CDN 源站配置成 WebDAV。**
+
+正确链路必须是：
+
+```text
+123cdn.example.com
+        ↓
+test6.example.com
+        ↓
+Makers Cloud Function
+        ↓
+WebDAV
+```
+
+---
+
+# 5. `/download/*` 规则引擎
+
+创建一条只针对下载路径的规则。
+
+匹配条件：
+
+```text
+HOST = 123cdn.example.com
+AND
+URL Path 前缀匹配 /download/
+```
+
+建议配置以下操作。
+
+## 5.1 节点缓存
 
 ```text
 节点缓存 TTL：30 天
 强制缓存：开启
+```
+
+下载 URL 使用版本化路径，并直接作为浏览器原生下载直链：
+
+```text
+/download/<version>/<webdav-relative-path>
+```
+
+文件 ETag / Last-Modified / Size 发生变化后会生成新 `version`，因此适合长缓存。
+
+## 5.2 Cache Key
+
+```text
+查询字符串：全部忽略
+```
+
+因为：
+
+```text
+/download/AAA/file.zip?token=111&t=111
+/download/AAA/file.zip?token=222&t=222
+```
+
+实际都是同一个版本的文件缓存。
+
+## 5.3 Token 鉴权
+
+```text
+方式：D
+主鉴权密钥：与 Makers CDN_AUTH_KEY 完全一致
+鉴权加密串参数：token
+时间戳参数：t
+时间格式：十进制 Unix 时间戳
+有效时长：3600 秒
+```
+
+## 5.4 分片回源
+
+```text
 分片回源：开启
-Cache Key：忽略全部 Query String
-Token 鉴权：方式 D
 ```
 
-### 为什么 Cache Key 要忽略 Query String
+必须开启，原因是普通浏览器完整文件请求如果 CDN MISS，需要 EdgeOne 把大文件拆成 Range 请求，否则 Cloud Function 无法一次返回 >6 MB 的文件。
 
-同一个文件每次生成的短期鉴权参数可能不同：
+浏览器现在只请求一条普通 CDN 直链，不主动拆 Range。EdgeOne 在 CDN MISS 时负责按“分片回源”机制向 Cloud Function 发 Range。Cloud Function 将收到的单段 Range 原样转发到 WebDAV。
+
+## 5.5 关键：注入 Origin Key
+
+增加操作：
 
 ```text
-/download/ABC?ticket=111&token=AAA&t=111
-/download/ABC?ticket=222&token=BBB&t=222
+修改 HTTP 回源请求头
 ```
 
-但真正代表文件版本的是：
+设置：
 
 ```text
-/download/ABC
+Header：X-CDN-Origin-Key
+值：与 Makers CDN_ORIGIN_KEY 完全一致
 ```
 
-因此 CDN 应忽略 Query String，使不同临时签名仍命中同一份节点缓存。
-
-> 必须同时启用 Token 鉴权，不能只忽略 Query String，否则缓存文件的访问控制会变弱。
-
----
-
-
-### CDN 下载故障快速判断
-
-#### 生成的下载地址是 `pages-scf-*.qcloudteo.com`
-
-旧版在只配置 `CDN_DOWNLOAD_HOST`、但没有 `CDN_AUTH_KEY` 时会回退到 Cloud Function 内部请求 origin，可能生成：
-
-```text
-https://pages-pro-xx.pages-scf-xx.qcloudteo.com/download/...
-```
-
-这个地址不是公网业务入口。v2.3 已修复：
-
-- CDN 配置完整时，下载 URL 必须以 `https://CDN_DOWNLOAD_HOST/download/...` 开头；
-- CDN 配置不完整时直接返回明确配置错误；
-- 完全不启用 CDN 时只返回 `/download/...` 相对路径，由浏览器使用当前 Makers 自定义域名。
-
-#### CDN 域名返回 `401 UNAUTHORIZED / Authentication Expired`
-
-如果错误页是 Makers 的 `Access Restricted or Authentication Expired`，通常说明 CDN 回源到了受 Preview 鉴权保护的 Makers 项目域名/部署域名。请把 CDN 源站改为稳定的 Makers 自定义域名：
-
-```text
-加速域名：123cdn.dasb.cn
-源站：test6.dasb.cn
-回源协议：HTTPS
-回源端口：443
-回源 HOST：test6.dasb.cn
-```
-
-同时确认下载 URL 含有：
-
-```text
-?ticket=...&token=<32位md5>&t=<Unix秒时间戳>
-```
-
-如果 CDN 规则启用了 Token 鉴权方式 D，但 URL 没有 `token` / `t`，检查 Makers 是否同时配置：
+例如 Makers：
 
 ```env
-CDN_DOWNLOAD_HOST=123cdn.dasb.cn
-CDN_AUTH_KEY=与 EdgeOne 方式 D 主密钥完全一致
-CDN_TOKEN_VALID_SECONDS=3600
+CDN_ORIGIN_KEY=some_random_secret_32_chars_or_more
 ```
 
-## 8. WebDAV 登录流程
+EdgeOne 回源规则：
 
-前端已经不再提供：
+```http
+X-CDN-Origin-Key: some_random_secret_32_chars_or_more
+```
+
+这样用户直接访问：
 
 ```text
-WebDAV 地址输入框
-账号输入框
-密码输入框
+https://test6.example.com/download/...
 ```
 
-用户点击：
+会得到：
 
 ```text
-连接并探测
+403 CDN_ORIGIN_FORBIDDEN
 ```
 
-服务端执行：
+只有真正经过 EdgeOne CDN 的回源请求才允许访问下载 Cloud Function。
+
+## 5.6 回源查询参数
+
+建议：
 
 ```text
-读取 WEBDAV_BASE_URL
-读取 WEBDAV_USERNAME
-读取 WEBDAV_PASSWORD
-        ↓
-PROPFIND 探测 WebDAV
-        ↓
-成功
-        ↓
-签发无凭据 session token
-        ↓
-浏览器开始文件管理
+回源请求参数设置 -> 查询字符串全部忽略
 ```
 
-浏览器只能看到：
+`token` 和 `t` 只用于 EdgeOne 节点鉴权，Makers Cloud Function 不需要这两个参数。
 
-- WebDAV URL
-- 脱敏后的用户名
-- 探测状态
-- 延迟
-- session token
+## 5.7 不要配置这些旧版项目规则
 
-浏览器不会收到 WebDAV 密码。
+v2.8 **不需要**：
+
+```text
+Authorization: Basic ...
+```
+
+也**不需要**把 `/download/*` 重写到 `/webdav/*`。
+
+这些是 v2.4 CDN 直接回源 WebDAV 的旧配置，应删除。
 
 ---
 
-## 9. 大文件上传
+# 6. WebDAV 出口与调用链
 
-### 为什么 v2.2 不再让 Cloud Function 直接 `request.arrayBuffer()`？
+## 6.1 所有 WebDAV 请求的统一出口
 
-Makers Node.js 运行时/适配层在部分请求场景中可能已经读取或解析 `Request.body`。如果函数再次调用 `request.arrayBuffer()` / `request.json()`，Undici 会抛出：
+部署 v2.8 后，WebDAV 服务器不应再收到来自 Makers Edge Function 或 EdgeOne CDN 节点直接发出的请求：
 
-```text
-TypeError: Body is unusable: Body has already been read
-```
+| WebDAV 操作 | 发起方 |
+| --- | --- |
+| 连接探测 `PROPFIND Depth: 0` | Makers Cloud Function |
+| 目录列表 `PROPFIND Depth: 1` | Makers Cloud Function（Edge KV MISS 时内部调用） |
+| 文件属性 / 下载 URL 元数据读取 | Makers Cloud Function |
+| 上传 `PUT` / 临时分片 `PUT` / 合并 | Makers Cloud Function |
+| 建目录 `MKCOL` | Makers Cloud Function |
+| 删除 `DELETE` | Makers Cloud Function |
+| 下载 `GET / Range` | Makers Cloud Function（仅 CDN MISS） |
 
-v2.2 从源头规避这个问题：**浏览器上传给 Cloud Function 的文件实体统一编码成 JSON + Base64**。服务端的 `readJson()` 还会优先复用 Makers 已经解析好的 `request.body`，不会二次消费 Request body。
+Edge Function 的职责只剩：session 校验、读取/写入 `WEBDAV_KV`、调用内部 Cloud Function。Edge Function 代码不再构造 WebDAV Basic Auth，也不再对 WebDAV 域名执行 `fetch()`。
 
-> Base64 会膨胀约 4/3。4 MiB 二进制分片编码后约 5.34 MiB，仍低于 Cloud Function 6 MB 请求 Body 上限，因此 `WEBDAV_CHUNK_BYTES` 在 v2.2 中最大固定为 4 MiB。
+## 6.2 下载调用链
 
-### ≤ 4 MiB
-
-```text
-浏览器 File/Blob
-  ↓ Base64
-POST application/json
-  ↓
-Cloud Function
-  ↓ Base64 解码为二进制
-WebDAV PUT
-```
-
-### > 4 MiB
+### CDN HIT
 
 ```text
 浏览器
-  ↓ 每片最多 4 MiB
-Blob.slice()
-  ↓ Base64
-POST /api/webdav/upload/chunk
   ↓
-Cloud Function 解码
+123cdn.example.com
+  ↓
+EdgeOne CDN HIT
+  ↓
+直接返回
+```
+
+WebDAV 请求数：0。
+
+### CDN MISS + EdgeOne 分片回源
+
+```text
+浏览器
+GET /download/<version>/<path>?token=...&t=...
+  ↓
+EdgeOne CDN
+  ↓ MISS / 分片回源
+Range: bytes=<由 EdgeOne 决定的单段范围>
+X-CDN-Origin-Key: ***
+  ↓
+Makers Cloud Function
+  ↓
+Authorization: Basic ***
+Range: 原样转发
+  ↓
+WebDAV
+  ↓ 206
+Cloud Function
+  ↓ 206
+EdgeOne CDN 缓存
+  ↓
+浏览器原生下载
+```
+
+### Cloud Function 下载路由
+
+项目新增：
+
+```text
+cloud-functions/download/[[path]].js
+```
+
+路由：
+
+```text
+/download/<64位版本号>/<WebDAV相对路径>
+```
+
+特性：
+
+- 只允许 `GET` / `HEAD` / `OPTIONS`。
+- `GET` 必须来自正确 `X-CDN-Origin-Key`。
+- 单段 Range 默认最大 4 MiB。
+- Range 原样转发至 WebDAV。
+- Range 请求要求 WebDAV 返回 `206 Partial Content`。
+- 不调用 `arrayBuffer()` 读取完整大文件；响应直接流式透传。
+- `200/206` 响应带可缓存 Header 和 CORS Header。
+
+---
+
+# 7. 大文件上传
+
+Cloud Function Body 上限 6 MB，上传继续采用 v2.2 之后的 JSON Base64 方案。
+
+## <= 4 MiB
+
+```text
+浏览器
+  ↓ Base64 JSON
+Cloud Function
   ↓ PUT
+WebDAV
+```
+
+## > 4 MiB
+
+```text
+浏览器
+  ↓ 4 MiB 分片 + Base64 JSON
+Cloud Function
+  ↓
 WebDAV /.edgeone-upload/<uploadId>/000000.part
 WebDAV /.edgeone-upload/<uploadId>/000001.part
 ...
-        ↓
-Cloud Function 流式读取临时分片
-        ↓
-最终 WebDAV PUT
-        ↓
-成功后删除临时分片目录
+  ↓
+Cloud Function 流式合并 PUT
+  ↓
+最终 WebDAV 文件
+  ↓
+删除临时目录
 ```
 
-当前主上传接口：
+不使用 Blob。
 
-```text
-POST /api/webdav/file
-POST /api/webdav/upload/chunk
-```
-
-旧版原始二进制 `PUT` 路由仍保留为兼容入口，但 Demo 前端不再使用它们。
-
-这个方案不使用 Blob。
-
-注意：分片上传绕开的是 Cloud Function 单次请求 Body 大小限制，但**最终合并仍受 Cloud Function 最大执行时间约束**。WebDAV 很慢、文件特别大时，最终合并可能超时。
+最终合并仍受 Cloud Function 120 秒执行时间限制。
 
 ---
 
-## 10. 大文件下载与 CDN
+# 8. 部署后的验证方法
 
-启用 CDN 后：
+## 验证下载 URL
+
+调用：
 
 ```text
-浏览器 Range 请求
-        ↓
-123cdn.dasb.cn
-        ↓
-EdgeOne CDN
-  ├─ HIT  → 节点直接返回
-  └─ MISS → Makers Edge Function
-                ↓
-          从环境变量读取凭据
-                ↓ Authorization + Range
-              WebDAV
-                ↓ 200 / 206 Stream
-          EdgeOne CDN 缓存
-                ↓
-              浏览器
+POST /api/webdav/download-url
 ```
 
-下载不经过 Cloud Function，因此不会被 Cloud Function 的小响应 Body 上限限制。
+应返回类似：
 
-Edge Function 不会把整个大文件读入内存，而是直接透传 WebDAV `ReadableStream`。
+```json
+{
+  "mode": "edgeone-cdn-native-direct-link",
+  "url": "https://123cdn.example.com/download/<version>/path/file.zip?token=...&t=...",
+  "cdn": {
+    "host": "123cdn.example.com",
+    "originMaxRangeBytes": 4194304,
+    "browserRangeAssembly": false,
+    "origin": "makers-cloud-function",
+    "originProtected": true
+  }
+}
+```
+
+不应再出现：
+
+```text
+edgeone-direct-webdav
+```
+
+也不应出现 Makers 内部 `pages-scf-...qcloudteo.com` 下载地址。
+
+## 验证目录请求已经全部从 Cloud Function 出口
+
+第一次打开一个未缓存目录时，`POST /api/webdav/list` 响应应包含：
+
+```text
+X-KV-Cache: MISS
+X-WebDAV-Origin: CLOUD-FUNCTION
+```
+
+JSON 中也会看到：
+
+```json
+{
+  "cache": {
+    "layer": "kv",
+    "hit": false,
+    "webdavOrigin": "makers-cloud-function"
+  }
+}
+```
+
+再次读取同目录并命中 KV 时：
+
+```text
+X-KV-Cache: HIT
+X-WebDAV-Origin: NONE
+```
+
+这次不会请求 Cloud Function，也不会请求 WebDAV。
+
+如果直接访问 `/api/internal/webdav/list` 且没有内部密钥，应返回：
+
+```text
+403 INTERNAL_ORIGIN_FORBIDDEN
+```
+
+## 验证原生直链与分片回源
+
+浏览器 F12 Network 应看到一个指向 `CDN_DOWNLOAD_HOST` 的普通下载请求，例如：
+
+```text
+https://123cdn.example.com/download/<version>/path/file.zip?token=...&t=...
+```
+
+前端不再自行发送连续 Range，也不再拼接文件。
+
+当 CDN 缓存 MISS 时，在 EdgeOne 回源日志、Makers Cloud Function 日志或 WebDAV 请求日志中应看到 `Range` 请求。具体单段大小由 EdgeOne 分片回源机制决定；Cloud Function 允许的单段上限由 `CDN_RANGE_BYTES` 控制，最大 4 MiB。
+
+## 验证 CDN HIT
+
+同一版本文件再次下载时检查：
+
+```text
+EO-Cache-Status
+```
+
+缓存命中后不会再请求 Cloud Function / WebDAV。
 
 ---
 
-## 11. 项目结构
+# 9. 安全建议
 
-```text
-cloud-functions/
-  api/webdav/
-    session.js
-    file.js
-    folder.js
-    delete.js
-    download-url.js
-    upload/
-      init.js
-      chunk.js
-      complete.js
-      cancel.js
-
-edge-functions/
-  api/webdav/
-    list.js
-    cache/invalidate.js
-  download/[fileId].js
-
-server/
-shared/
-index.html
-app.js
-styles.css
-edgeone.json
-.env.example
-README.md
-```
+- `WEBDAV_PASSWORD`、`WEBDAV_SESSION_SECRET`、`WEBDAV_INTERNAL_KEY`、`CDN_AUTH_KEY`、`CDN_ORIGIN_KEY` 都不要提交到 Git。
+- `WEBDAV_INTERNAL_KEY`、`CDN_AUTH_KEY` 与 `CDN_ORIGIN_KEY` 使用三个不同的随机值。
+- Internal Key 与 CDN Origin Key 都至少 24 位，建议 32~64 位。
+- 对 `/download/*` 保留 Token D 鉴权。
+- 不要开放 Cloud Function 下载 origin 给公网直接调用。
+- WebDAV 必须 HTTPS。
+- 若仅使用 123 WebDAV，建议将 `WEBDAV_ALLOWED_HOSTS` 限制到对应 WebDAV 域名。
+- 目录 KV 不存密码，不存文件内容。
+- Edge Function 不再直连 WebDAV；如果 WebDAV 日志仍出现明显来自全球 Edge 节点的 `PROPFIND`，说明线上仍部署了旧版目录函数或缓存规则未更新。
 
 ---
 
-## 12. 部署
-
-项目已经包含 `edgeone.json`：
-
-```text
-Node.js：20.18.0
-Cloud Function maxDuration：120 秒
-构建命令：npm run build
-输出目录：dist
-```
-
-推荐步骤：
-
-1. Fork / 上传到 GitHub 私有或公开仓库。
-2. 在 EdgeOne Makers 导入项目。
-3. 配置所有必填环境变量。
-4. 如需 KV，绑定 `WEBDAV_KV`。
-5. 如需 CDN，配置 `CDN_DOWNLOAD_HOST` / `CDN_AUTH_KEY`。
-6. 重新触发 Production 部署。
-7. 打开前端点击“连接并探测”。
-8. 上传一个小文件测试 WebDAV 写入。
-9. 下载同一文件两次，确认 CDN 第二次开始出现缓存命中。
-
----
-
-## 13. 本地开发
+# 10. 本地测试
 
 ```bash
-npm install
 npm run check
 npm test
 npm run build
 ```
 
-使用 EdgeOne CLI 时，本地环境变量可以放在本地私有配置中，但不要提交真实 `.env`。
+当前测试覆盖：
 
-`.gitignore` 应始终排除：
+- 环境变量 WebDAV 凭据。
+- `WEBDAV_INTERNAL_KEY` 保护内部目录 Cloud Function。
+- Edge Function KV MISS 只调用内部 Cloud Function，不直接请求 WebDAV。
+- 内部目录 Cloud Function 统一发出 `PROPFIND` 到 WebDAV。
+- Edge Function KV HIT 时 WebDAV / Cloud Function 请求数为 0。
+- session 不包含账号密码。
+- Makers body 已被解析情况下的 Base64 分片上传。
+- 4 MiB 上传分片。
+- 大文件 WebDAV 临时分片合并。
+- CDN Token D URL。
+- `CDN_ORIGIN_KEY` 防绕过。
+- Cloud Function 单段 Range 转发与 4 MiB 安全上限。
+- 206 / Content-Range / CORS。
+- >4 MiB Range 拒绝。
+- 不同单段 Range 大小与 4 MiB 上限。
 
-```text
-.env
-.env.local
-.env.*.local
+### 冷缓存首次下载的 1-byte Range 探测
+
+浏览器仍然只使用一个最终下载直链，不会在前端分片或拼接大文件。为了兼容 EdgeOne 冷缓存首次完整 GET 的分片回源识别，前端在交给浏览器原生下载前会先对同一个 CDN URL 发起一次：
+
+```http
+Range: bytes=0-0
 ```
 
----
-
-## 14. 安全注意事项
-
-1. **WebDAV 必须使用 HTTPS。**
-2. **不要把 `WEBDAV_PASSWORD` 提交到 Git。**
-3. **不要把 `WEBDAV_SESSION_SECRET` 或 `CDN_AUTH_KEY` 提交到 Git。**
-4. 公开项目建议定期轮换 WebDAV 密码和两个随机密钥。
-5. CDN 下载 URL 属于短期 bearer URL，不要把完整 query string 写进公开日志或统计平台。
-6. 保持页面 `Referrer-Policy: no-referrer`。
-7. CDN 使用“忽略 Query String Cache Key”时，必须同时启用 EdgeOne Token 鉴权。
-8. 如果 WebDAV 不支持 Range，CDN 分片回源效果会降低。
-9. WebDAV 地址、账号、密码改变后，建议重新部署并清理旧 CDN 缓存 / 等待旧版本 URL 淘汰。
-
----
-
-## 15. 常见问题
-
-### 前端为什么没有账号密码输入框？
-
-因为当前版本是固定后端模式。账号密码由部署者在 Makers 环境变量中配置，访问者只能操作这个固定 WebDAV。
-
-### 环境变量配置后为什么仍提示缺少变量？
-
-确认变量配置在 **Production 环境**，然后重新部署。环境变量变更通常需要新的生产部署才能让所有函数实例使用新值。
-
-### CDN 没启用怎么办？
-
-确认同时存在：
+该请求只读取 1 byte，用于让 CDN 获取源站的 `206`、`Content-Range`、文件总大小和 Range 支持信息。探测完成后立即通过同一条 CDN URL 启动浏览器原生下载。
 
 ```text
-CDN_DOWNLOAD_HOST
-CDN_AUTH_KEY
+点击下载
+  ↓
+Cloud Function 生成 CDN 直链
+  ↓
+1-byte Range 探测（仅元数据/首字节，不拼接文件）
+  ↓
+浏览器原生 GET 下载
+  ↓
+EdgeOne CDN HIT 或分片回源
+  ↓ MISS
+Makers Cloud Function → WebDAV Range
 ```
 
-只配置域名但没配置 Token 主密钥时，项目不会进入完整 CDN 鉴权模式。
-
-### 下载返回 403？
-
-优先检查：
-
-```text
-Makers CDN_AUTH_KEY
-=
-EdgeOne 123cdn.dasb.cn Token 鉴权方式 D 主密钥
-```
-
-两边必须完全一致。
-
-### KV 显示 BYPASS？
-
-说明没有绑定名为 `WEBDAV_KV` 的 KV Namespace，不影响基础功能。
-
-### 分片上传报 `Body has already been read`？
-
-如果日志包含：
-
-```text
-TypeError: Body is unusable: Body has already been read
-```
-
-说明仍在运行 v2.1 或更旧的前端/函数代码，其中分片接口会对原始二进制 PUT 调用 `request.arrayBuffer()`。请部署 v2.2，并确认浏览器 Network 中分片请求变为：
-
-```text
-POST /api/webdav/upload/chunk
-Content-Type: application/json
-```
-
-而不是旧版：
-
-```text
-PUT /api/webdav/upload/chunk?uploadId=...&index=...
-Content-Type: application/octet-stream
-```
-
-如果重新部署后浏览器仍发 PUT，请清除浏览器缓存/CDN 静态缓存或强制刷新页面，确保加载的是新版 `app.js`。
+如果日志仍出现 `RANGE_REQUIRED`，请先确认 1-byte 探测请求是否返回 `206` 且响应包含类似 `Content-Range: bytes 0-0/123456789`。

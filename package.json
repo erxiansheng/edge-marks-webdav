@@ -1,9 +1,9 @@
 {
   "name": "edgeone-makers-webdav-gateway",
-  "version": "2.3.0",
+  "version": "2.8.0",
   "private": true,
   "type": "module",
-  "description": "EdgeOne Makers fixed-backend WebDAV gateway with env credentials, chunked uploads, KV metadata cache and native CDN range downloads",
+  "description": "EdgeOne Makers WebDAV gateway where every WebDAV request originates from Cloud Function, with Edge KV directory cache, chunked uploads and native CDN direct-link downloads",
   "scripts": {
     "build": "node scripts/build.mjs",
     "check": "node scripts/check.mjs",

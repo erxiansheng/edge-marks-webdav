@@ -1,8 +1,10 @@
 import { InputError, normalizeBaseUrl } from '../shared/webdav-common.js';
 
 export const DEFAULT_CHUNK_BYTES = 4 * 1024 * 1024;
-// JSON Base64 传输会膨胀约 4/3；4 MiB 二进制编码后约 5.34 MiB，安全低于 Cloud Function 6 MB Body 上限。
+// JSON Base64 传输会膨胀约 4/3；4 MiB 二进制编码后约 5.34 MiB，低于 Cloud Function 6 MB Body 上限。
 export const MAX_DIRECT_BYTES = 4 * 1024 * 1024;
+export const DEFAULT_CDN_RANGE_BYTES = 4 * 1024 * 1024;
+export const MAX_CDN_RANGE_BYTES = 4 * 1024 * 1024;
 
 export function pick(env, key, fallback = '') {
   const fromContext = env && typeof env[key] === 'string' ? env[key].trim() : '';
@@ -62,18 +64,34 @@ export function getTempRoot(env = {}) {
   return root.startsWith('/') ? root.replace(/\/+$/, '') : `/${root.replace(/\/+$/, '')}`;
 }
 
+export function getCdnRangeBytes(env = {}) {
+  const value = Number(pick(env, 'CDN_RANGE_BYTES', String(DEFAULT_CDN_RANGE_BYTES)));
+  return Number.isFinite(value)
+    ? Math.max(1024 * 1024, Math.min(Math.floor(value), MAX_CDN_RANGE_BYTES))
+    : DEFAULT_CDN_RANGE_BYTES;
+}
+
+export function getCdnOriginKey(env = {}) {
+  const originKey = pick(env, 'CDN_ORIGIN_KEY');
+  if (!originKey || originKey.length < 24) {
+    throw new InputError(
+      '缺少 CDN_ORIGIN_KEY，且长度至少需要 24 个字符。该密钥用于限制 /download/* 仅允许 EdgeOne CDN 回源访问。',
+      'CDN_ORIGIN_KEY_MISSING',
+      503
+    );
+  }
+  return originKey;
+}
+
 export function getCdnConfig(env = {}) {
   const host = pick(env, 'CDN_DOWNLOAD_HOST').replace(/^https?:\/\//, '').replace(/\/+$/, '');
   const authKey = pick(env, 'CDN_AUTH_KEY');
   const tokenValidSeconds = Number(pick(env, 'CDN_TOKEN_VALID_SECONDS', '3600'));
   const normalizedTtl = Number.isFinite(tokenValidSeconds) ? Math.max(60, tokenValidSeconds) : 3600;
 
-  // CDN 配置必须成对出现。旧版在只配置 CDN_DOWNLOAD_HOST 时会静默回退到
-  // Cloud Function 的内部 pages-scf 域名，浏览器最终拿到不可访问的内部 URL。
-  // 这里改为显式报错，避免错误链接被下发给前端。
   if (host && !authKey) {
     throw new InputError(
-      '已配置 CDN_DOWNLOAD_HOST，但缺少 CDN_AUTH_KEY。请在 Makers 环境变量中配置与 EdgeOne Token 鉴权方式 D 主密钥完全一致的 CDN_AUTH_KEY。',
+      '已配置 CDN_DOWNLOAD_HOST，但缺少 CDN_AUTH_KEY。请配置与 EdgeOne Token 鉴权方式 D 主密钥一致的 CDN_AUTH_KEY。',
       'CDN_AUTH_KEY_MISSING',
       503
     );
@@ -85,11 +103,18 @@ export function getCdnConfig(env = {}) {
       503
     );
   }
+  if (!host || !authKey) {
+    return { host, authKey, tokenValidSeconds: normalizedTtl, rangeBytes: getCdnRangeBytes(env), enabled: false };
+  }
+
+  // 启用 CDN 下载时必须同时启用 Origin Key，避免用户绕过 CDN Token 鉴权直接访问 Makers 下载函数。
+  getCdnOriginKey(env);
 
   return {
     host,
     authKey,
     tokenValidSeconds: normalizedTtl,
-    enabled: Boolean(host && authKey)
+    rangeBytes: getCdnRangeBytes(env),
+    enabled: true
   };
 }
