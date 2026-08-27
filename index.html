@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="robots" content="noindex,nofollow" />
+  <title>EdgeOne WebDAV Gateway</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="background-grid"></div>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <div class="eyebrow">EDGEONE MAKERS · WEBDAV · CDN RANGE CACHE</div>
+        <h1>WebDAV Gateway</h1>
+        <p>固定 WebDAV 后端由 Makers 环境变量提供。Cloud Function 负责管理与分片上传，Edge Function 负责目录缓存与 CDN 回源网关，EdgeOne 原生 CDN 缓存大文件 Range。</p>
+      </div>
+      <div id="connectionBadge" class="status-badge offline"><span class="status-dot"></span><span>未连接</span></div>
+    </header>
+
+    <section class="notice">
+      <strong>安全模型：</strong>WebDAV 地址、账号、密码仅存在于服务端环境变量；浏览器不接收密码，也不会把凭据写入 session token、下载 ticket、KV 或 Blob。文件永久只存 WebDAV。
+    </section>
+
+    <section class="panel connection-panel">
+      <div class="panel-heading"><div><span class="section-index">01</span><h2>连接服务端 WebDAV</h2></div></div>
+      <div class="server-config-grid">
+        <div class="server-config-card">
+          <span class="server-config-label">配置来源</span>
+          <strong>Makers 环境变量</strong>
+          <small>WEBDAV_BASE_URL / WEBDAV_USERNAME / WEBDAV_PASSWORD</small>
+        </div>
+        <div class="server-config-card">
+          <span class="server-config-label">浏览器凭据</span>
+          <strong>不可见</strong>
+          <small>页面只保存短期无凭据 session token</small>
+        </div>
+        <button id="connectButton" class="button primary" type="button">连接并探测</button>
+      </div>
+      <div id="configSummary" class="config-summary empty">请先在 EdgeOne Makers 项目中配置 WebDAV 环境变量，然后点击“连接并探测”。</div>
+    </section>
+
+    <section class="panel explorer-panel">
+      <div class="panel-heading explorer-heading">
+        <div><span class="section-index">02</span><h2>文件浏览器</h2></div>
+        <div class="toolbar">
+          <button id="parentButton" class="button ghost" type="button" disabled>上一级</button>
+          <button id="newFolderButton" class="button ghost" type="button" disabled>新建目录</button>
+          <button id="reloadButton" class="button ghost" type="button" disabled>刷新</button>
+        </div>
+      </div>
+      <div class="path-bar"><span>当前路径</span><code id="currentPath">/</code><span id="cacheBadge" class="cache-badge">KV BYPASS</span></div>
+      <div id="dropZone" class="drop-zone disabled">
+        <input id="fileInput" type="file" hidden />
+        <div class="drop-icon">⇧</div>
+        <div><strong>拖入文件，或点击选择</strong><span>≤4 MiB 直接上传；更大文件自动按 4 MiB 分片写入 WebDAV 临时目录并流式合并</span></div>
+        <button id="chooseFileButton" class="button secondary" type="button" disabled>选择文件</button>
+      </div>
+      <div id="uploadProgress" class="upload-progress hidden"><div class="progress-meta"><span id="progressText">准备上传</span><strong id="progressValue">0%</strong></div><div class="progress-track"><div id="progressBar" class="progress-bar"></div></div></div>
+      <div class="table-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>大小</th><th>修改时间</th><th class="actions-column">操作</th></tr></thead><tbody id="fileTableBody"><tr class="empty-row"><td colspan="5">尚未连接 WebDAV</td></tr></tbody></table></div>
+    </section>
+
+    <section class="panel log-panel">
+      <div class="panel-heading"><div><span class="section-index">03</span><h2>调试日志</h2></div><button id="clearLogButton" class="button ghost" type="button">清空</button></div>
+      <div id="logOutput" class="log-output" aria-live="polite"></div>
+    </section>
+  </main>
+  <div id="toast" class="toast" role="status"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
