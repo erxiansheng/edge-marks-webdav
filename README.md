@@ -14,6 +14,7 @@
 ---
 
 ## 1. 架构
+<img width="1672" height="941" alt="ChatGPT Image 2026年8月27日 13_30_22" src="https://github.com/user-attachments/assets/9a6fa3f8-1a7e-4a3e-9cfa-ba16bdae8356" />
 
 ```text
                            EdgeOne Makers
